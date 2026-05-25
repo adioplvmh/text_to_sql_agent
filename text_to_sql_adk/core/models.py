@@ -13,10 +13,10 @@ class ModelsConfig(TypedDict):
 
 
 DEFAULT_MODELS: ModelsConfig = {
-    "schema_inspection": "gemini-2.5-flash",
+    "schema_inspection": "gemini-2.5-pro",
     "sql_generation": "gemini-2.5-pro",
-    "sql_evaluation": "gemini-2.5-flash",
-    "research": "gemini-2.5-flash",
+    "sql_evaluation": "gemini-2.5-pro",
+    "research": "gemini-2.5-pro",
     "orchestration": "gemini-2.5-pro",
 }
 
