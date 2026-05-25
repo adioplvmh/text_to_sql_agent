@@ -13,7 +13,10 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,18 @@ log = logging.getLogger(__name__)
 console = Console()
 
 DATASET_PATH = Path(__file__).parent / "data" / "dataset.jsonl"
+
+# ── Single persistent background loop (same pattern as streamlit_app_v2) ─────
+_EVAL_LOOP: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+_eval_thread = threading.Thread(
+    target=_EVAL_LOOP.run_forever, daemon=True, name="eval-worker"
+)
+_eval_thread.start()
+
+
+def _run_in_loop(coro):
+    """Submit a coroutine to _EVAL_LOOP and block until done."""
+    return asyncio.run_coroutine_threadsafe(coro, _EVAL_LOOP).result(timeout=300)
 
 
 def load_dataset(
@@ -47,55 +62,71 @@ def load_dataset(
     return records
 
 
-def run_agent_on_query(schema_context: str, record: dict) -> tuple[str, dict, dict]:
-    """
-    Run the Text-to-SQL agent on a single record.
-    Returns (generated_sql, gen_result, eval_metrics).
-    """
-    from text_to_sql_adk.core.tools.sql_executor import execute_sql
-    from text_to_sql_adk.core.tools.sql_evaluator import evaluate_sql
+# ── Agent runner (created once inside _EVAL_LOOP, reused for all queries) ────
+_runner = None
+_eval_session_id: str = str(uuid.uuid4())
 
-    # For evaluation purposes we call the generation agent directly via the
-    # google-adk synchronous API. In full agentic mode use app.stream_query().
-    try:
-        from text_to_sql_adk.agent import create_text_to_sql_agent
-        # Direct synchronous call — simpler for batch evaluation
-        import vertexai
-        from vertexai.agent_engines import AdkApp
+
+def _get_runner():
+    global _runner
+    if _runner is not None:
+        return _runner
+
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from text_to_sql_adk.agent import create_text_to_sql_agent
+
+    async def _setup():
         agent = create_text_to_sql_agent()
-        adk_app = AdkApp(agent=agent)
+        svc = InMemorySessionService()
+        runner = Runner(agent=agent, app_name="text_to_sql_eval", session_service=svc)
+        await svc.create_session(
+            app_name="text_to_sql_eval",
+            user_id="evaluator",
+            session_id=_eval_session_id,
+        )
+        return runner
 
-        generated_sql = None
-        response_text = ""
+    _runner = _run_in_loop(_setup())
+    return _runner
 
-        async def _run():
-            nonlocal generated_sql, response_text
-            async for event in adk_app.async_stream_query(
-                user_id="evaluator",
-                message=record["nl_query"],
-            ):
-                if hasattr(event, "text"):
-                    response_text += event.text or ""
-                # Try to extract SQL from tool call events
-                if hasattr(event, "tool_calls"):
-                    for tc in event.tool_calls:
-                        if tc.get("name") == "execute_sql_tool":
-                            generated_sql = tc.get("args", {}).get("sql_query")
 
-        asyncio.run(_run())
+async def _call_agent_async(nl_query: str) -> str:
+    """Call the agent and return the generated SQL (or empty string)."""
+    from google.genai import types as genai_types
 
-        # Fall back: extract first code block from response text
-        if not generated_sql:
-            import re
-            m = re.search(r"```(?:sql)?\n(.+?)```", response_text, re.DOTALL)
-            if m:
-                generated_sql = m.group(1).strip()
+    runner = _get_runner()
+    content = genai_types.Content(
+        role="user", parts=[genai_types.Part(text=nl_query)]
+    )
+    response_text = ""
 
+    async for event in runner.run_async(
+        user_id="evaluator",
+        session_id=_eval_session_id,
+        new_message=content,
+    ):
+        if event.is_final_response():
+            if event.content and event.content.parts:
+                response_text = event.content.parts[0].text or ""
+
+    # Extract SQL from markdown code block
+    m = re.search(r"```(?:sql)?\n(.+?)```", response_text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fall back: bare SELECT statement
+    m2 = re.search(r"(SELECT\s.+?)(?:\n\n|$)", response_text, re.DOTALL | re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+    return ""
+
+
+def run_agent_on_query(schema_context: str, record: dict) -> tuple[str, dict, dict]:
+    """Run the Text-to-SQL agent on a single record."""
+    try:
+        generated_sql = _run_in_loop(_call_agent_async(record["nl_query"]))
     except Exception as exc:
-        log.warning("Agent call failed for %s: %s", record["id"], exc)
-        generated_sql = None
-
-    if not generated_sql:
+        log.warning("Agent call failed for %s: %s", record.get("id"), exc)
         generated_sql = ""
 
     gen_result = execute_sql(generated_sql) if generated_sql else {
