@@ -15,13 +15,12 @@ import json
 import logging
 import re
 import sys
-import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
-from rich.progress import track
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 from rich.table import Table
 
 from text_to_sql_adk.core.tools.schema_inspector import get_schema_context
@@ -32,18 +31,6 @@ log = logging.getLogger(__name__)
 console = Console()
 
 DATASET_PATH = Path(__file__).parent / "data" / "dataset.jsonl"
-
-# ── Single persistent background loop (same pattern as streamlit_app_v2) ─────
-_EVAL_LOOP: asyncio.AbstractEventLoop = asyncio.new_event_loop()
-_eval_thread = threading.Thread(
-    target=_EVAL_LOOP.run_forever, daemon=True, name="eval-worker"
-)
-_eval_thread.start()
-
-
-def _run_in_loop(coro):
-    """Submit a coroutine to _EVAL_LOOP and block until done."""
-    return asyncio.run_coroutine_threadsafe(coro, _EVAL_LOOP).result(timeout=300)
 
 
 def load_dataset(
@@ -62,69 +49,72 @@ def load_dataset(
     return records
 
 
-# ── Agent runner (created once inside _EVAL_LOOP, reused for all queries) ────
-_runner = None
-_eval_session_id: str = str(uuid.uuid4())
-
-
-def _get_runner():
-    global _runner
-    if _runner is not None:
-        return _runner
-
-    from google.adk.runners import Runner
-    from google.adk.sessions import InMemorySessionService
-    from text_to_sql_adk.agent import create_text_to_sql_agent
-
-    async def _setup():
-        agent = create_text_to_sql_agent()
-        svc = InMemorySessionService()
-        runner = Runner(agent=agent, app_name="text_to_sql_eval", session_service=svc)
-        await svc.create_session(
-            app_name="text_to_sql_eval",
-            user_id="evaluator",
-            session_id=_eval_session_id,
-        )
-        return runner
-
-    _runner = _run_in_loop(_setup())
-    return _runner
-
-
-async def _call_agent_async(nl_query: str) -> str:
-    """Call the agent and return the generated SQL (or empty string)."""
+async def _call_agent_async(runner, nl_query: str) -> str:
+    """Call the agent with a fresh session and return the generated SQL."""
     from google.genai import types as genai_types
 
-    runner = _get_runner()
+    # Fresh session per query — no history bleed-over
+    session_id = str(uuid.uuid4())
+    await runner.session_service.create_session(
+        app_name="text_to_sql_eval",
+        user_id="evaluator",
+        session_id=session_id,
+    )
+
     content = genai_types.Content(
         role="user", parts=[genai_types.Part(text=nl_query)]
     )
+    captured_sql = ""
     response_text = ""
 
-    async for event in runner.run_async(
-        user_id="evaluator",
-        session_id=_eval_session_id,
-        new_message=content,
-    ):
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                response_text = event.content.parts[0].text or ""
+    try:
+        async for event in runner.run_async(
+            user_id="evaluator",
+            session_id=session_id,
+            new_message=content,
+        ):
+            if event.content:
+                for part in event.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        fc = part.function_call
+                        args = dict(fc.args) if fc.args else {}
+                        sql_arg = (
+                            args.get("sql_query")
+                            or args.get("query")
+                            or args.get("sql")
+                            or ""
+                        )
+                        if sql_arg and sql_arg.strip().upper().startswith("SELECT"):
+                            captured_sql = sql_arg.strip()
 
-    # Extract SQL from markdown code block
+            if event.is_final_response():
+                if event.content and event.content.parts:
+                    response_text = event.content.parts[0].text or ""
+    except Exception as exc:
+        log.warning("Agent stream error for query %r: %s", nl_query[:60], exc)
+
+    if captured_sql:
+        return captured_sql
+
     m = re.search(r"```(?:sql)?\n(.+?)```", response_text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # Fall back: bare SELECT statement
     m2 = re.search(r"(SELECT\s.+?)(?:\n\n|$)", response_text, re.DOTALL | re.IGNORECASE)
     if m2:
         return m2.group(1).strip()
     return ""
 
 
-def run_agent_on_query(schema_context: str, record: dict) -> tuple[str, dict, dict]:
-    """Run the Text-to-SQL agent on a single record."""
+async def run_agent_on_query_async(runner, record: dict) -> tuple[str, dict, dict]:
+    """Run the agent on one record and return (generated_sql, gen_result, metrics)."""
     try:
-        generated_sql = _run_in_loop(_call_agent_async(record["nl_query"]))
+        generated_sql = await asyncio.wait_for(
+            _call_agent_async(runner, record["nl_query"]),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Timeout for query %s", record.get("id"))
+        generated_sql = ""
     except Exception as exc:
         log.warning("Agent call failed for %s: %s", record.get("id"), exc)
         generated_sql = ""
@@ -154,26 +144,47 @@ def build_report(results: list[dict]) -> dict[str, Any]:
     exact_matches = sum(1 for r in results if r["evaluation"]["execution_match"])
     avg_semantic = sum(r["evaluation"]["semantic_score"] for r in results) / total
     avg_overall = sum(r["evaluation"]["overall_score"] for r in results) / total
+    avg_rouge_l = sum(r["evaluation"].get("rouge_l", 0) for r in results) / total
+    avg_emb_sim = sum(r["evaluation"].get("embedding_similarity", 0) for r in results) / total
 
     by_level: dict[int, dict] = {}
     for r in results:
         lvl = r["level"]
-        by_level.setdefault(lvl, {"total": 0, "exact": 0, "semantic_sum": 0.0})
+        by_level.setdefault(lvl, {
+            "total": 0, "exact": 0,
+            "semantic_sum": 0.0, "rouge_l_sum": 0.0, "emb_sim_sum": 0.0,
+            "col_prec_sum": 0.0, "col_rec_sum": 0.0, "row_overlap_sum": 0.0,
+        })
         by_level[lvl]["total"] += 1
         if r["evaluation"]["execution_match"]:
             by_level[lvl]["exact"] += 1
         by_level[lvl]["semantic_sum"] += r["evaluation"]["semantic_score"]
+        by_level[lvl]["rouge_l_sum"] += r["evaluation"].get("rouge_l", 0)
+        by_level[lvl]["emb_sim_sum"] += r["evaluation"].get("embedding_similarity", 0)
+        by_level[lvl]["col_prec_sum"] += r["evaluation"].get("column_precision", 0)
+        by_level[lvl]["col_rec_sum"] += r["evaluation"].get("column_recall", 0)
+        by_level[lvl]["row_overlap_sum"] += r["evaluation"].get("row_overlap", 0)
 
-    for lvl, stats in by_level.items():
-        stats["exact_match_rate"] = round(stats["exact"] / stats["total"], 3)
-        stats["avg_semantic"] = round(stats["semantic_sum"] / stats["total"], 3)
-        del stats["semantic_sum"]
+    for lvl, s in by_level.items():
+        n = s["total"]
+        s["exact_match_rate"] = round(s["exact"] / n, 3)
+        s["avg_semantic"] = round(s["semantic_sum"] / n, 3)
+        s["avg_rouge_l"] = round(s["rouge_l_sum"] / n, 3)
+        s["avg_embedding_similarity"] = round(s["emb_sim_sum"] / n, 3)
+        s["avg_column_precision"] = round(s["col_prec_sum"] / n, 3)
+        s["avg_column_recall"] = round(s["col_rec_sum"] / n, 3)
+        s["avg_row_overlap"] = round(s["row_overlap_sum"] / n, 3)
+        for k in ["semantic_sum", "rouge_l_sum", "emb_sim_sum",
+                  "col_prec_sum", "col_rec_sum", "row_overlap_sum"]:
+            del s[k]
 
     return {
         "total_queries": total,
         "overall_exact_match_rate": round(exact_matches / total, 3),
         "overall_semantic_score": round(avg_semantic, 3),
         "overall_score": round(avg_overall, 3),
+        "overall_rouge_l": round(avg_rouge_l, 3),
+        "overall_embedding_similarity": round(avg_emb_sim, 3),
         "by_level": by_level,
         "records": results,
     }
@@ -203,17 +214,14 @@ def print_summary_table(report: dict):
     console.print(table)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate Text-to-SQL agent on H&M dataset")
-    parser.add_argument("--level", type=int, default=None, help="Filter to a specific difficulty level (1-6)")
-    parser.add_argument("--limit", type=int, default=None, help="Maximum number of queries to evaluate")
-    parser.add_argument("--output", type=str, default="evaluation_results.json", help="Output JSON file")
-    args = parser.parse_args()
+async def async_main(args):
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from text_to_sql_adk.agent import create_text_to_sql_agent
 
     console.print("[bold blue]Text-to-SQL Agent Evaluation[/bold blue]")
     console.print(f"Dataset: {DATASET_PATH}")
 
-    # Load schema context once
     console.print("Loading schema context…")
     try:
         schema_context = get_schema_context()
@@ -221,14 +229,30 @@ def main():
         console.print(f"[red]Could not load schema — is the DB running? {exc}[/red]")
         sys.exit(1)
 
+    console.print("Initialising agent…")
+    agent = create_text_to_sql_agent()
+    svc = InMemorySessionService()
+    runner = Runner(agent=agent, app_name="text_to_sql_eval", session_service=svc)
+
     records = load_dataset(level_filter=args.level, limit=args.limit)
-    console.print(f"Loaded {len(records)} queries to evaluate.")
+    total = len(records)
+    console.print(f"Loaded {total} queries to evaluate.")
+
+    if args.progress_file:
+        Path(args.progress_file).write_text(json.dumps({"done": 0, "total": total}))
 
     results = []
-    for record in track(records, description="Evaluating…"):
-        generated_sql, gen_result, metrics = run_agent_on_query(schema_context, record)
-        results.append(
-            {
+    with Progress(
+        SpinnerColumn(),
+        "[progress.description]{task.description}",
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Evaluating…", total=total)
+        for i, record in enumerate(records, start=1):
+            progress.update(task, description=f"[{i}/{total}] {record['id']} …")
+            generated_sql, gen_result, metrics = await run_agent_on_query_async(runner, record)
+            results.append({
                 "query_id": record["id"],
                 "template_id": record["template_id"],
                 "level": record["level"],
@@ -238,8 +262,10 @@ def main():
                 "generated_sql": generated_sql,
                 "gen_row_count": gen_result.get("row_count", 0),
                 "evaluation": metrics,
-            }
-        )
+            })
+            progress.advance(task)
+            if args.progress_file:
+                Path(args.progress_file).write_text(json.dumps({"done": i, "total": total}))
 
     report = build_report(results)
     print_summary_table(report)
@@ -249,5 +275,26 @@ def main():
     console.print(f"\n[green]Results saved to {output_path}[/green]")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate Text-to-SQL agent on H&M dataset")
+    parser.add_argument("--level", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--output", type=str, default="evaluation_results.json")
+    parser.add_argument("--progress-file", type=str, default=None)
+    args = parser.parse_args()
+    asyncio.run(async_main(args))
+
+
 if __name__ == "__main__":
     main()
+
+
+from text_to_sql_adk.core.tools.schema_inspector import get_schema_context
+from text_to_sql_adk.core.tools.sql_executor import execute_sql
+from text_to_sql_adk.core.tools.sql_evaluator import evaluate_sql
+
+log = logging.getLogger(__name__)
+console = Console()
+
+DATASET_PATH = Path(__file__).parent / "data" / "dataset.jsonl"
+
